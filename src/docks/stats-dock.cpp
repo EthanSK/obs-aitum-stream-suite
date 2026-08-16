@@ -7,6 +7,7 @@
 #include <QTableView>
 #include <QVBoxLayout>
 #include <src/utils/color.hpp>
+#include <src/utils/output-health.hpp>
 
 extern obs_data_t *current_profile_config;
 extern QTabBar *modesTabBar;
@@ -25,6 +26,7 @@ StatsDock::StatsDock(QWidget *parent) : QFrame(parent)
 	auto proxyModel = new QSortFilterProxyModel(this);
 	proxyModel->setSourceModel(model);
 	proxyModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
+	proxyModel->setSortRole(Qt::UserRole + 2);
 
 	table->setModel(proxyModel);
 	table->setHorizontalHeader(new GroupedHeaderView(Qt::Horizontal, table));
@@ -146,7 +148,9 @@ QVariant OutputStatsModel::data(const QModelIndex &index, int role) const
 	if (role == Qt::DisplayRole) {
 		auto column = columns[index.column()];
 		auto row = rows[index.row()];
-		return column.get_value(row);
+		auto value = column.get_value(row);
+		return column.percentage && value.isValid() ? QVariant(QString::number(value.toDouble(), 'f', 1) + "%")
+							    : value;
 	} else if (role == Qt::UserRole) {
 		auto column = columns[index.column()];
 		if (column.get_graph) {
@@ -159,6 +163,10 @@ QVariant OutputStatsModel::data(const QModelIndex &index, int role) const
 		return QVariant(column.alignment);
 	} else if (role == Qt::UserRole + 1) {
 		return QVariant((qlonglong)&rows[index.row()]);
+	} else if (role == Qt::UserRole + 2) {
+		auto column = columns[index.column()];
+		auto row = rows[index.row()];
+		return column.get_value(row); // Keep percentage columns numerically sortable even though their display includes a percent sign. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 	}
 	return QVariant();
 }
@@ -258,7 +266,11 @@ void OutputStatsModel::updateStats()
 
 				if (row.output == output) {
 					row.active_delay = obs_output_get_active_delay(output);
-					row.dropped_frames = obs_output_get_frames_dropped(output);
+					row.is_stream_output = (obs_output_get_flags(output) & OBS_OUTPUT_SERVICE) != 0;
+					const auto health = GetOutputHealthStats(output);
+					row.dropped_frames = health.dropped_frames;
+					row.dropped_percentage = health.dropped_percentage;
+					row.congestion_percentage = health.congestion_percentage;
 					auto output_bytes = obs_output_get_total_bytes(output);
 					row.output_bitrate =
 						output_bytes > row.output_bytes ? (output_bytes - row.output_bytes) * 8 / 1000 : 0;

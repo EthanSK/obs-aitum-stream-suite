@@ -8,15 +8,30 @@
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QRegularExpression>
+#include <QStyle>
 #include <QTime>
 #include <src/utils/color.hpp>
 #include <src/utils/icon.hpp>
 #include <src/utils/obs-websocket-api.h>
+#include <src/utils/output-health.hpp>
 #include <util/config-file.h>
 #include <util/platform.h>
 
 extern obs_data_t *current_profile_config;
 extern bool isTwitchServer(QString outputServer);
+
+#ifdef __APPLE__
+static constexpr uint32_t APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT = 8;
+
+static uint32_t nearest_apple_videotoolbox_safe_dimension(uint32_t dimension)
+{
+	if (dimension < APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT)
+		return APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT;
+	return ((dimension + APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT / 2) /
+		APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT) *
+	       APPLE_VIDEOTOOLBOX_SAFE_DIMENSION_ALIGNMENT;
+}
+#endif
 
 OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(parent), settings(output_data)
 {
@@ -25,6 +40,7 @@ OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(pa
 	auto name = QString::fromUtf8(nameChars);
 
 	setObjectName(name);
+	setProperty("streaming", false);
 
 	auto outputLayout = new QHBoxLayout;
 	outputLayout->setContentsMargins(5, 0, 5, 0);
@@ -221,6 +237,7 @@ OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(pa
 	}
 	outputButton->setCheckable(true);
 	outputButton->setChecked(false);
+	outputButton->setEnabled(obs_data_get_bool(settings, "enabled"));
 
 	connect(outputButton, &QPushButton::clicked, [this]() {
 		auto output_type = obs_data_get_string(settings, "type");
@@ -230,6 +247,7 @@ OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(pa
 			if (!StartOutput())
 				outputButton->setChecked(false);
 		} else {
+			outputButton->setChecked(true); // A checkable button unchecks before clicked runs; restore the live state before any confirmation dialog so stop never flickers off and back on. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 			bool stop = true;
 
 			if (output_type[0] == '\0' || strcmp(output_type, "stream") == 0) {
@@ -247,13 +265,12 @@ OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(pa
 			if (stop) {
 				blog(LOG_INFO, "[Aitum Stream Suite] stop %s output clicked '%s'", output_type,
 				     obs_data_get_string(settings, "name"));
+				SetStopping(true);
 
 				obs_queue_task(
 					OBS_TASK_GRAPHICS, [](void *param) { obs_output_stop((obs_output_t *)param); }, output,
 					false);
 
-			} else {
-				outputButton->setChecked(true);
 			}
 		}
 	});
@@ -320,8 +337,33 @@ OutputWidget::OutputWidget(obs_data_t *output_data, QWidget *parent) : QFrame(pa
 	obs_data_array_release(stop_hotkey);
 
 	connect(&activeTimer, &QTimer::timeout, this, [this] {
+		if (stopping)
+			return;
 		auto t = QTime::fromMSecsSinceStartOfDay(startTime.msecsTo(QDateTime::currentDateTime()));
-		(extraButton ? extraButton : outputButton)->setText(t.toString(t.hour() ? "hh:mm:ss" : "mm:ss"));
+		auto button = extraButton ? extraButton : outputButton;
+		if (IsStream() && output) {
+			const auto elapsed = outputBitrateTimer.elapsed();
+			if (elapsed >= 1000) {
+				const auto outputBytes = obs_output_get_total_bytes(output);
+				outputBitrateKbps = outputBytes >= lastOutputBytes
+							? (double)(outputBytes - lastOutputBytes) * 8.0 / (double)elapsed
+							: 0.0;
+				lastOutputBytes = outputBytes;
+				outputBitrateTimer.restart();
+			}
+			const auto health = GetOutputHealthStats(output);
+			const auto bitrateMbps = QString::number(outputBitrateKbps / 1000.0, 'f', 1);
+			const auto droppedPercentage = QString::number(health.dropped_percentage, 'f', 1);
+			button->setText(QString::fromUtf8(obs_module_text("StreamHealthSummary"))
+						.arg(bitrateMbps, droppedPercentage,
+						     t.toString(t.hour() ? "hh:mm:ss" : "mm:ss"))); // Keep each output's transport health visible without pretending shared OBS CPU can be split by destination. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+			button->setToolTip(QString::fromUtf8(obs_module_text("OutputHealthTooltip"))
+						   .arg(bitrateMbps, QString::number(health.dropped_frames),
+							QString::number(health.total_frames), droppedPercentage,
+							QString::number(health.congestion_percentage, 'f', 1)));
+		} else {
+			button->setText(t.toString(t.hour() ? "hh:mm:ss" : "mm:ss"));
+		}
 	});
 }
 
@@ -341,6 +383,7 @@ OutputWidget::~OutputWidget()
 		signal_handler_t *signal = obs_output_get_signal_handler(output);
 		signal_handler_disconnect(signal, "start", output_start, this);
 		signal_handler_disconnect(signal, "stop", output_stop, this);
+		signal_handler_disconnect(signal, "deactivate", output_deactivate, this);
 		if (strcmp(obs_output_get_id(output), "virtualcam_output") == 0) {
 			obs_output_set_media(output, obs_get_video(), obs_get_audio());
 		}
@@ -358,9 +401,14 @@ void OutputWidget::output_start(void *data, calldata_t *calldata)
 		this_->onStarted();
 		this_->onStarted = nullptr;
 	}
-	if (this_->outputButton->isChecked())
-		return;
-	QMetaObject::invokeMethod(this_->outputButton, [this_] { this_->outputButton->setChecked(true); }, Qt::QueuedConnection);
+	QMetaObject::invokeMethod(
+		this_->outputButton,
+		[this_] {
+			this_->SetStarting(false);
+			this_->SetStopping(false);
+			this_->outputButton->setChecked(true);
+		},
+		Qt::QueuedConnection);
 }
 
 void OutputWidget::replay_saved(void *data, calldata_t *calldata)
@@ -407,10 +455,14 @@ void OutputWidget::output_stop(void *data, calldata_t *calldata)
 		this_->onStarted();
 		this_->onStarted = nullptr;
 	}
-	if (this_->outputButton->isChecked()) {
-		QMetaObject::invokeMethod(
-			this_->outputButton, [this_] { this_->outputButton->setChecked(false); }, Qt::QueuedConnection);
-	}
+	QMetaObject::invokeMethod(
+		this_->outputButton,
+		[this_] {
+			this_->SetStarting(false);
+			this_->SetStopping(false);
+			this_->outputButton->setChecked(false);
+		},
+		Qt::QueuedConnection);
 
 	if (this_->output) {
 		const char *error = (const char *)calldata_ptr(calldata, "last_error");
@@ -418,17 +470,18 @@ void OutputWidget::output_stop(void *data, calldata_t *calldata)
 		if (error)
 			last_error = error;
 		auto code = calldata_int(calldata, "code");
+		const std::string output_name = obs_output_get_name(this_->output); // A failed RTMP output emits stop before its worker exits, so releasing it from this queued UI callback waits on that worker and freezes OBS; retain the inactive output until the next start or widget destruction. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 		QMetaObject::invokeMethod(
 			this_->outputButton,
-			[this_, last_error, code] {
+			[this_, last_error, code, output_name] {
 				if (this_->output && strcmp(obs_output_get_id(this_->output), "virtualcam_output") == 0) {
 					obs_output_set_media(this_->output, obs_get_video(), obs_get_audio());
 				}
-				obs_output_release(this_->output);
-				this_->output = nullptr;
+				blog(LOG_INFO, "[Aitum Stream Suite] output '%s' stopped with code %lld; retained for safe cleanup",
+				     output_name.c_str(), (long long)code);
 				if (vendor) {
 					const auto d = obs_data_create();
-					obs_data_set_string(d, "output", obs_output_get_name(this_->output));
+					obs_data_set_string(d, "output", output_name.c_str());
 					if (!last_error.empty())
 						obs_data_set_string(d, "last_error", last_error.c_str());
 					obs_data_set_int(d, "code", code);
@@ -441,10 +494,46 @@ void OutputWidget::output_stop(void *data, calldata_t *calldata)
 	}
 }
 
+void OutputWidget::output_deactivate(void *data, calldata_t *calldata)
+{
+	auto this_ = static_cast<OutputWidget *>(data);
+	auto deactivated_output = static_cast<obs_output_t *>(calldata_ptr(calldata, "output"));
+	if (!deactivated_output) {
+		return;
+	}
+
+	obs_output_get_ref(deactivated_output);
+	const std::string output_name = obs_output_get_name(deactivated_output);
+	QMetaObject::invokeMethod(
+		this_->outputButton,
+		[this_, deactivated_output, output_name] {
+			this_->SetStarting(false);
+			this_->SetStopping(false);
+			if (this_->output == deactivated_output) {
+				auto signal = obs_output_get_signal_handler(deactivated_output);
+				signal_handler_disconnect(signal, "start", output_start, this_);
+				signal_handler_disconnect(signal, "stop", output_stop, this_);
+				signal_handler_disconnect(signal, "deactivate", output_deactivate, this_);
+				if (strcmp(obs_output_get_id(deactivated_output), "virtualcam_output") == 0) {
+					obs_output_set_media(deactivated_output, obs_get_video(), obs_get_audio());
+				}
+				this_->output = nullptr;
+				obs_output_release(deactivated_output); // The widget-owned reference is safe to release only after OBS deactivates the output; releasing it from the earlier stop signal can wait on the output worker and freeze OBS. This also releases inactive encoders so their canvas can be resized. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+				blog(LOG_INFO, "[Aitum Stream Suite] output '%s' deactivated and released", output_name.c_str());
+			}
+			obs_output_release(deactivated_output);
+		},
+		Qt::QueuedConnection);
+}
+
 bool OutputWidget::StartOutput(bool automated)
 {
 	if (!settings)
 		return false;
+	if (!obs_data_get_bool(settings, "enabled")) { // Disabled destinations must stay out of Start All so an unfinished or invalid stream configuration cannot be started accidentally. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+		blog(LOG_INFO, "[Aitum Stream Suite] skipped disabled output '%s'", obs_data_get_string(settings, "name"));
+		return false;
+	}
 
 	auto output_type = obs_data_get_string(settings, "type");
 	if (!automated && (output_type[0] == '\0' || strcmp(output_type, "stream") == 0)) {
@@ -489,11 +578,15 @@ bool OutputWidget::StartOutput(bool automated)
 		signal_handler_t *signal = obs_output_get_signal_handler(vco);
 		signal_handler_disconnect(signal, "start", output_start, this);
 		signal_handler_disconnect(signal, "stop", output_stop, this);
+		signal_handler_disconnect(signal, "deactivate", output_deactivate, this);
 		signal_handler_connect(signal, "start", output_start, this);
 		signal_handler_connect(signal, "stop", output_stop, this);
+		signal_handler_connect(signal, "deactivate", output_deactivate, this);
 
 		obs_output_set_media(vco, obs_canvas_get_video(canvas), obs_get_audio());
+		SetStarting(true);
 		if (!obs_output_start(vco)) {
+			SetStarting(false);
 			obs_canvas_release(canvas);
 			return false;
 		}
@@ -592,10 +685,14 @@ bool OutputWidget::StartOutput(bool automated)
 		signal_handler_t *signal = obs_output_get_signal_handler(output);
 		signal_handler_disconnect(signal, "start", output_start, this);
 		signal_handler_disconnect(signal, "stop", output_stop, this);
+		signal_handler_disconnect(signal, "deactivate", output_deactivate, this);
 		signal_handler_connect(signal, "start", output_start, this);
 		signal_handler_connect(signal, "stop", output_stop, this);
+		signal_handler_connect(signal, "deactivate", output_deactivate, this);
 
+		SetStarting(true);
 		if (!obs_output_start(output)) {
+			SetStarting(false);
 			obs_output_release(output);
 			output = nullptr;
 			return false;
@@ -962,10 +1059,12 @@ bool OutputWidget::StartOutput(bool automated)
 	signal_handler_t *signal = obs_output_get_signal_handler(output);
 	signal_handler_disconnect(signal, "start", output_start, this);
 	signal_handler_disconnect(signal, "stop", output_stop, this);
+	signal_handler_disconnect(signal, "deactivate", output_deactivate, this);
 	if (extraButton)
 		signal_handler_disconnect(signal, "saved", replay_saved, this);
 	signal_handler_connect(signal, "start", output_start, this);
 	signal_handler_connect(signal, "stop", output_stop, this);
+	signal_handler_connect(signal, "deactivate", output_deactivate, this);
 	if (extraButton)
 		signal_handler_connect(signal, "saved", replay_saved, this);
 
@@ -979,7 +1078,9 @@ bool OutputWidget::StartOutput(bool automated)
 		obs_encoder_release(aencs[i]);
 	}
 
+	SetStarting(true);
 	if (!obs_output_start(output)) {
+		SetStarting(false);
 		obs_output_release(output);
 		output = nullptr;
 		return false;
@@ -1152,9 +1253,26 @@ obs_encoder_t *OutputWidget::GetVideoEncoder(obs_data_t *settings, bool advanced
 					obs_encoder_set_frame_rate_divisor(venc, (uint32_t)divisor);
 
 				bool scale = obs_data_get_bool(settings, "scale");
+				uint32_t scale_width = (uint32_t)obs_data_get_int(settings, "width");
+				uint32_t scale_height = (uint32_t)obs_data_get_int(settings, "height");
+#ifdef __APPLE__
+				if (strcmp(venc_name, "com.apple.videotoolbox.videoencoder.ave.avc") == 0) {
+					const uint32_t requested_width = scale ? scale_width : obs_encoder_get_width(venc);
+					const uint32_t requested_height = scale ? scale_height : obs_encoder_get_height(venc);
+					const uint32_t safe_width = nearest_apple_videotoolbox_safe_dimension(requested_width);
+					const uint32_t safe_height = nearest_apple_videotoolbox_safe_dimension(requested_height);
+					if (safe_width != requested_width || safe_height != requested_height) {
+						scale = true;
+						scale_width = safe_width;
+						scale_height = safe_height;
+						blog(LOG_WARNING,
+						     "[Aitum++] Apple VT H264 output '%s' aligned from %ux%u to %ux%u to prevent diagonal row-stride corruption",
+						     output_name, requested_width, requested_height, safe_width, safe_height); // A 1670x1080 extra canvas produced diagonally sheared Twitch and Kick frames while the main recording stayed clean; scaling the encoder to 1672x1080 keeps hardware encoding and prevents that OBS multi-canvas row-stride failure. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+					}
+				}
+#endif
 				if (scale) {
-					obs_encoder_set_scaled_size(venc, (uint32_t)obs_data_get_int(settings, "width"),
-								    (uint32_t)obs_data_get_int(settings, "height"));
+					obs_encoder_set_scaled_size(venc, scale_width, scale_height);
 					obs_encoder_set_gpu_scale_type(venc,
 								       (obs_scale_type)obs_data_get_int(settings, "scale_type"));
 				}
@@ -1261,14 +1379,37 @@ bool OutputWidget::EncoderAvailable(const char *encoder)
 void OutputWidget::CheckActive()
 {
 	bool active = obs_output_active(output);
+	if (starting && !active)
+		return;
+	if (starting)
+		SetStarting(false);
+	if (stopping && active)
+		return;
+	if (stopping)
+		SetStopping(false);
+	const auto streaming = active && IsStream();
+	if (property("streaming").toBool() != streaming) {
+		setProperty("streaming", streaming);
+		style()->unpolish(this);
+		style()->polish(this);
+		update(); // A live destination must colour the whole row so an unnoticed stream is obvious; recording rows deliberately keep their existing treatment. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+	}
 	if (outputButton->isChecked() != active)
 		outputButton->setChecked(active);
 	if (activeTimer.isActive() != active) {
 		if (active) {
 			startTime = QDateTime::currentDateTime();
+			lastOutputBytes = obs_output_get_total_bytes(output);
+			outputBitrateKbps = 0.0;
+			outputBitrateTimer.start();
 			activeTimer.start(500);
 		} else {
 			activeTimer.stop();
+			outputBitrateTimer.invalidate();
+			lastOutputBytes = 0;
+			outputBitrateKbps = 0.0;
+			if (IsStream())
+				outputButton->setToolTip(QString::fromUtf8(obs_module_text("Stream")));
 			if (extraButton)
 				extraButton->setText("");
 			else
@@ -1319,11 +1460,44 @@ void OutputWidget::UpdateSettings(obs_data_t *data)
 	obs_data_release(settings);
 	settings = data;
 	obs_data_addref(settings);
+	outputButton->setEnabled(obs_data_get_bool(settings, "enabled") && !starting && !stopping);
 	UpdateCanvas();
+}
+
+void OutputWidget::SetStarting(bool value)
+{
+	starting = value;
+	if (starting)
+		stopping = false;
+	outputButton->setEnabled(obs_data_get_bool(settings, "enabled") && !starting && !stopping); // The pending label and disabled button make one accepted start visible and prevent accidental duplicate starts. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+	auto button = extraButton ? extraButton : outputButton;
+	if (starting) {
+		button->setText(QString::fromUtf8(obs_module_text("StartingOutput")));
+		button->repaint();
+	} else if (!output || !obs_output_active(output)) {
+		button->setText("");
+	}
+}
+
+void OutputWidget::SetStopping(bool value)
+{
+	stopping = value;
+	if (stopping)
+		starting = false;
+	outputButton->setEnabled(obs_data_get_bool(settings, "enabled") && !starting && !stopping);
+	auto button = extraButton ? extraButton : outputButton;
+	if (stopping) {
+		outputButton->setChecked(true);
+		button->setText(QString::fromUtf8(obs_module_text("StoppingOutput")));
+		button->repaint(); // Stop is asynchronous, so keep the live state visible and block duplicate clicks until OBS confirms the output stopped. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+	} else if (!output || !obs_output_active(output)) {
+		button->setText("");
+	}
 }
 
 void OutputWidget::UpdateCanvas()
 {
+	QString outputStyle = "OutputWidget[streaming=\"true\"] { background: rgb(0,210,153); }";
 	auto canvas_name = obs_data_get_string(settings, "canvas");
 	auto video_encoders = obs_data_get_array(settings, "video_encoders");
 	auto count = obs_data_array_count(video_encoders);
@@ -1350,13 +1524,14 @@ void OutputWidget::UpdateCanvas()
 		auto cn = obs_data_get_string(item, "name");
 		if (cn[0] != '\0' && strcmp(cn, canvas_name) == 0) {
 			auto c = color_from_int(obs_data_get_int(item, "color"));
-			setStyleSheet(QString(".output-frame { border: 2px solid %1;}").arg(c.name(QColor::HexRgb)));
+			outputStyle += QString("OutputWidget { border: 2px solid %1;}").arg(c.name(QColor::HexRgb));
 			obs_data_release(item);
 			break;
 		}
 		obs_data_release(item);
 	}
 	obs_data_array_release(canvas);
+	setStyleSheet(outputStyle);
 }
 
 void OutputWidget::ensure_directory(char *path)
@@ -1411,6 +1586,7 @@ void OutputWidget::StopOutput()
 {
 	if (!output || !obs_output_active(output))
 		return;
+	SetStopping(true);
 
 	if (obs_output_get_active_delay(output) > 0) {
 		obs_output_stop(output);

@@ -25,6 +25,12 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs)
 
 find_package(Qt6 COMPONENTS Widgets Core)
+if(APPLE AND TARGET WrapOpenGL::WrapOpenGL)
+  # Xcode 26 removed the AGL binary, but Qt 6.8.3 still adds the now-empty system framework; OpenGL itself remains linked separately.
+  get_target_property(_wrap_opengl_libraries WrapOpenGL::WrapOpenGL INTERFACE_LINK_LIBRARIES)
+  list(FILTER _wrap_opengl_libraries EXCLUDE REGEX "(^|[/ ])AGL($|[./ ])")
+  set_property(TARGET WrapOpenGL::WrapOpenGL PROPERTY INTERFACE_LINK_LIBRARIES "${_wrap_opengl_libraries}")
+endif()
 if(BUILD_OUT_OF_TREE)
   if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
     find_package(Qt6 REQUIRED Gui)

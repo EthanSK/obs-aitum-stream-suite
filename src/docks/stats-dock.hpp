@@ -54,7 +54,10 @@ struct OutputStatsRow {
 	uint32_t encoded_width = 0;
 	uint32_t encoded_height = 0;
 	uint32_t active_delay = 0;
+	bool is_stream_output = false;
 	uint32_t dropped_frames = 0;
+	double dropped_percentage = 0.0;
+	double congestion_percentage = 0.0;
 	uint64_t output_bytes = 0;
 	uint32_t output_bitrate = 0;
 	QImage output_bitrate_graph = QImage(1, 24, QImage::Format_ARGB32);
@@ -76,6 +79,7 @@ struct OutputStatsColumn {
 	int alignment;
 	QVariant (*get_value)(const OutputStatsRow &row);
 	QImage (*get_graph)(OutputStatsRow *row, uint32_t width);
+	bool percentage = false;
 };
 
 class OutputStatsModel : public QAbstractTableModel {
@@ -108,6 +112,18 @@ private:
 			 row->output_bitrate_graph_width = width;
 			 return row->output_bitrate_graph;
 		 }},
+		{"Output", "DroppedFrames", true, Qt::AlignRight | Qt::AlignVCenter,
+		 [](const OutputStatsRow &row) {
+			 return row.is_stream_output ? QVariant(row.dropped_frames) : QVariant();
+		 }},
+		{"Output", "DroppedPercent", true, Qt::AlignRight | Qt::AlignVCenter,
+		 [](const OutputStatsRow &row) {
+			 return row.is_stream_output ? QVariant(row.dropped_percentage) : QVariant();
+		 }, nullptr, true},
+		{"Output", "CongestionPercent", true, Qt::AlignRight | Qt::AlignVCenter,
+		 [](const OutputStatsRow &row) {
+			 return row.is_stream_output ? QVariant(row.congestion_percentage) : QVariant();
+		 }, nullptr, true},
 		{"Output", "TotalData", true, Qt::AlignRight | Qt::AlignVCenter,
 		 [](const OutputStatsRow &row) {
 			 return QVariant((qulonglong)row.output_bytes);

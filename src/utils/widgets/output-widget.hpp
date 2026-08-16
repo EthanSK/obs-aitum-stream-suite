@@ -6,6 +6,7 @@
 #include <QPushButton>
 #include <QTimer>
 #include <QDateTime>
+#include <QElapsedTimer>
 
 class OutputWidget : public QFrame {
 	Q_OBJECT
@@ -22,6 +23,11 @@ private:
 
 	QTimer activeTimer;
 	QDateTime startTime;
+	QElapsedTimer outputBitrateTimer;
+	uint64_t lastOutputBytes = 0;
+	double outputBitrateKbps = 0.0;
+	bool starting = false;
+	bool stopping = false;
 
 	obs_hotkey_pair_id StartStopHotkey = OBS_INVALID_HOTKEY_PAIR_ID;
 	obs_hotkey_pair_id PauseHotkey = OBS_INVALID_HOTKEY_PAIR_ID;
@@ -30,11 +36,14 @@ private:
 	obs_hotkey_id chapterHotkey = OBS_INVALID_HOTKEY_ID;
 
 	bool StartOutput(bool automated = false);
+	void SetStarting(bool value);
+	void SetStopping(bool value);
 	void UpdateCanvas();
 	obs_encoder_t *GetVideoEncoder(obs_data_t *settings, bool advanced, bool is_record, const char *output_name,
 				       bool automated);
 
 	static void output_stop(void *data, calldata_t *calldata);
+	static void output_deactivate(void *data, calldata_t *calldata);
 	static void output_start(void *data, calldata_t *calldata);
 	static void replay_saved(void *data, calldata_t *calldata);
 	static bool EncoderAvailable(const char *encoder);
@@ -45,6 +54,7 @@ public:
 	~OutputWidget();
 
 	obs_output_t *GetOutput() const { return output; }
+	bool IsStopping() const { return stopping; }
 
 	void CheckActive();
 	void SaveSettings();

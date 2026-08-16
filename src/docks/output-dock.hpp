@@ -3,12 +3,16 @@
 #include <obs.h>
 #include <obs-frontend-api.h>
 #include <QCheckBox>
+#include <QElapsedTimer>
 #include <QFrame>
 #include <QGridLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QTimer>
 #include <src/utils/widgets/output-widget.hpp>
+
+class QAction;
+class QToolButton;
 
 class OutputDock : public QFrame {
 	Q_OBJECT
@@ -27,13 +31,24 @@ private:
 	QFrame *mainRecordGroup = nullptr;
 	QFrame *mainBacktrackGroup = nullptr;
 	QFrame *mainVirtualCamGroup = nullptr;
+	QAction *startAllAction = nullptr;
+	QToolButton *startAllButton = nullptr;
+	QAction *stopAllAction = nullptr;
+	QToolButton *stopAllButton = nullptr;
 	QString mainPlatformUrl;
 	bool exiting = false;
+	bool outputsStarting = false;
+	bool outputsStopping = false;
+	bool mainStreamStarting = false;
+	bool mainStreamStopping = false;
 	bool mainStreamEnabled = true;
 	bool mainRecordEnabled = true;
 	bool mainBacktrackEnabled = true;
 	bool mainVirtualCamEnabled = true;
 	QDateTime mainStreamStartTime;
+	QElapsedTimer mainStreamBitrateTimer;
+	uint64_t mainStreamBytes = 0;
+	double mainStreamBitrateKbps = 0.0;
 	QDateTime mainRecordStartTime;
 	QDateTime mainBacktrackStartTime;
 	QDateTime mainVirtualCamStartTime;
@@ -55,6 +70,9 @@ private:
 	std::function<void()> mainVirtualCamOnStarted;
 
 	static void frontend_event(enum obs_frontend_event event, void *private_data);
+	void SetOutputsStarting(bool starting);
+	void SetOutputsStopping(bool stopping);
+	void UpdateMainStreamRowStyle(bool active);
 
 private slots:
 	void StartAll(bool streamOnly, bool recordOnly);
@@ -73,6 +91,8 @@ public:
 	bool AddChapterToOutput(const char *output_name, const char *chapter_name);
 
 public slots:
+	void UpdateMainStreamStarting();
+	void UpdateMainStreamStopping();
 	void UpdateMainStreamStatus(bool active);
 	void UpdateMainRecordingStatus(bool active);
 	void UpdateMainBacktrackStatus(bool active);

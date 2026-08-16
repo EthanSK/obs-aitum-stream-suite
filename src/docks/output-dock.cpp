@@ -15,8 +15,10 @@
 #include <QScrollArea>
 #include <QToolBar>
 #include <QToolButton>
+#include <QStyle>
 #include <src/utils/color.hpp>
 #include <src/utils/icon.hpp>
+#include <src/utils/output-health.hpp>
 #include <util/config-file.h>
 #include <util/platform.h>
 
@@ -59,14 +61,14 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 	toolbar->widgetForAction(a)->setProperty("themeID", QVariant(QString::fromUtf8("addIconSmall")));
 	toolbar->widgetForAction(a)->setProperty("class", "icon-plus");
 
-	a = toolbar->addAction(
+	startAllAction = toolbar->addAction(
 #if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
 		QIcon::fromTheme(QIcon::ThemeIcon::MediaPlaybackStart, QIcon(":/res/images/media/media_play.svg")),
 #else
 		QIcon(":/res/images/media/media_play.svg"),
 #endif
 		QString::fromUtf8(obs_module_text("StartAll")));
-	connect(a, &QAction::triggered, [this] {
+	connect(startAllAction, &QAction::triggered, [this] {
 		QMenu startMenu;
 		auto a2 = startMenu.addAction(
 #if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
@@ -91,21 +93,24 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 		}
 		startMenu.exec(QCursor::pos());
 	});
-	toolbar->widgetForAction(a)->setProperty("themeID", QVariant(QString::fromUtf8("playIcon")));
-	toolbar->widgetForAction(a)->setProperty("class", "icon-media-play");
-	a->setIconText(QString::fromUtf8(obs_module_text("StartAll")));
-	((QToolButton *)toolbar->widgetForAction(a))->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-	toolbar->widgetForAction(a)->setStyleSheet("QToolButton { min-width: 80px; max-width: none; }");
+	startAllButton = static_cast<QToolButton *>(toolbar->widgetForAction(startAllAction));
+	startAllButton->setProperty("themeID", QVariant(QString::fromUtf8("playIcon")));
+	startAllButton->setProperty("class", "icon-media-play");
+	startAllAction->setIconText(QString::fromUtf8(obs_module_text("StartAll")));
+	startAllButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	startAllButton->setStyleSheet("QToolButton { min-width: 80px; max-width: none; }");
 
-	a = toolbar->addAction(
+	stopAllAction = toolbar->addAction(
 #if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
 		QIcon::fromTheme(QIcon::ThemeIcon::MediaPlaybackStop, QIcon(":/res/images/media/media_stop.svg")),
 #else
 		QIcon(":/res/images/media/media_stop.svg"),
 #endif
 		QString::fromUtf8(obs_module_text("StopAllOutputs")), [this] { StopAll(false, false); });
-	toolbar->widgetForAction(a)->setProperty("themeID", QVariant(QString::fromUtf8("stopIcon")));
-	toolbar->widgetForAction(a)->setProperty("class", "icon-media-stop");
+	stopAllButton = static_cast<QToolButton *>(toolbar->widgetForAction(stopAllAction));
+	stopAllButton->setProperty("themeID", QVariant(QString::fromUtf8("stopIcon")));
+	stopAllButton->setProperty("class", "icon-media-stop");
+	stopAllButton->setStyleSheet("QToolButton { min-width: 30px; max-width: none; }");
 
 	a = addMenu->addAction(QIcon(QString::fromUtf8(":/aitum/media/stream.svg")), QString::fromUtf8(obs_module_text("Stream")),
 			       [this] { open_config_dialog(2, "stream"); });
@@ -151,8 +156,11 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 	mainStreamButton->setChecked(false);
 
 	connect(mainStreamButton, &QPushButton::clicked, [this] {
+		if (mainStreamStarting || mainStreamStopping)
+			return;
 		const auto config = obs_frontend_get_user_config();
 		if (obs_frontend_streaming_active()) {
+			mainStreamButton->setChecked(true); // A checkable button unchecks before clicked runs; restore the live state before any confirmation dialog so stop never flickers off and back on. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 			bool stop = true;
 			bool warnBeforeStreamStop = config_get_bool(config, "BasicWindow", "WarnBeforeStoppingStream");
 			if (warnBeforeStreamStop && isVisible()) {
@@ -164,10 +172,8 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 					stop = false;
 			}
 			if (stop) {
+				UpdateMainStreamStopping();
 				obs_frontend_streaming_stop();
-				mainStreamButton->setChecked(false);
-			} else {
-				mainStreamButton->setChecked(true);
 			}
 		} else {
 			bool warnBeforeStreamStart = config_get_bool(config, "BasicWindow", "WarnBeforeStartingStream");
@@ -178,13 +184,15 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 					QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
 				if (button == QMessageBox::No) {
 					mainStreamButton->setChecked(false);
+					return;
 				} else {
+					UpdateMainStreamStarting();
 					obs_frontend_streaming_start();
 				}
 			} else {
+				UpdateMainStreamStarting();
 				obs_frontend_streaming_start();
 			}
-			mainStreamButton->setChecked(true);
 		}
 	});
 	//streamButton->setSizePolicy(sp2);
@@ -193,6 +201,10 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 	//mainLayout->addLayout(l2);
 
 	mainStreamGroup = new QFrame;
+	mainStreamGroup->setObjectName(QStringLiteral("mainStreamRow"));
+	mainStreamGroup->setProperty("streaming", false);
+	mainStreamGroup->setStyleSheet(
+		"QFrame#mainStreamRow[streaming=\"true\"] { background: rgb(0,210,153); }");
 	mainStreamGroup->setLayout(l2);
 
 	mainLayout->addWidget(mainStreamGroup);
@@ -332,13 +344,50 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 
 		if (mainStreamEnabled) {
 			auto active = obs_frontend_streaming_active();
-			if (mainStreamButton->isChecked() != active) {
-				mainStreamButton->setChecked(active);
-				if (!active)
-					mainStreamButton->setText("");
-			} else if (active) {
+			if (mainStreamStopping) {
+				UpdateMainStreamRowStyle(true);
+			} else { // OBS can report inactive before the final stopped event; keep Stopping… visible until that event confirms completion. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+				UpdateMainStreamRowStyle(active);
+				if (mainStreamButton->isChecked() != active) {
+					mainStreamButton->setChecked(active);
+					if (!active) {
+						mainStreamButton->setText("");
+						mainStreamBitrateTimer.invalidate();
+						mainStreamBytes = 0;
+						mainStreamBitrateKbps = 0.0;
+					}
+				} else if (active) {
 				auto t = QTime::fromMSecsSinceStartOfDay(mainStreamStartTime.msecsTo(QDateTime::currentDateTime()));
-				mainStreamButton->setText(t.toString(t.hour() ? "hh:mm:ss" : "mm:ss"));
+				auto output = obs_frontend_get_streaming_output();
+				OutputHealthStats health;
+				if (output) {
+					if (!mainStreamBitrateTimer.isValid()) {
+						mainStreamBytes = obs_output_get_total_bytes(output);
+						mainStreamBitrateTimer.start();
+					} else {
+						const auto elapsed = mainStreamBitrateTimer.elapsed();
+						if (elapsed >= 1000) {
+							const auto outputBytes = obs_output_get_total_bytes(output);
+							mainStreamBitrateKbps = outputBytes >= mainStreamBytes
+										? (double)(outputBytes - mainStreamBytes) * 8.0 / (double)elapsed
+										: 0.0;
+							mainStreamBytes = outputBytes;
+							mainStreamBitrateTimer.restart();
+						}
+					}
+					health = GetOutputHealthStats(output);
+					obs_output_release(output);
+				}
+				const auto bitrateMbps = QString::number(mainStreamBitrateKbps / 1000.0, 'f', 1);
+				const auto droppedPercentage = QString::number(health.dropped_percentage, 'f', 1);
+				mainStreamButton->setText(QString::fromUtf8(obs_module_text("StreamHealthSummary"))
+								  .arg(bitrateMbps, droppedPercentage,
+								       t.toString(t.hour() ? "hh:mm:ss" : "mm:ss"))); // Keep built-in and custom streams consistent so every destination exposes its own transport health. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+				mainStreamButton->setToolTip(QString::fromUtf8(obs_module_text("OutputHealthTooltip"))
+								     .arg(bitrateMbps, QString::number(health.dropped_frames),
+									  QString::number(health.total_frames), droppedPercentage,
+									  QString::number(health.congestion_percentage, 'f', 1)));
+				}
 			}
 		}
 
@@ -388,6 +437,21 @@ OutputDock::OutputDock(QWidget *parent) : QFrame(parent)
 
 		for (auto it = outputWidgets.begin(); it != outputWidgets.end(); it++) {
 			(*it)->CheckActive();
+		}
+		if (outputsStopping) {
+			bool active = (mainStreamEnabled && obs_frontend_streaming_active()) ||
+				      (mainRecordEnabled && obs_frontend_recording_active()) ||
+				      (mainBacktrackEnabled && obs_frontend_replay_buffer_active()) ||
+				      (mainVirtualCamEnabled && obs_frontend_virtualcam_active());
+			for (auto *outputWidget : outputWidgets) {
+				auto output = outputWidget->GetOutput();
+				if (outputWidget->IsStopping() || (output && obs_output_active(output))) {
+					active = true;
+					break;
+				}
+			}
+			if (!active)
+				SetOutputsStopping(false);
 		}
 	});
 	videoCheckTimer.start(500);
@@ -567,14 +631,45 @@ void OutputDock::SaveSettings()
 	}
 }
 
+void OutputDock::UpdateMainStreamStarting()
+{
+	mainStreamStarting = true;
+	mainStreamStopping = false;
+	mainStreamButton->setChecked(true);
+	mainStreamButton->setEnabled(false); // A stream start is asynchronous, so disable repeat clicks and show the pending state until OBS reports started or stopped. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+	mainStreamButton->setText(QString::fromUtf8(obs_module_text("StartingOutput")));
+	mainStreamButton->repaint();
+}
+
+void OutputDock::UpdateMainStreamStopping()
+{
+	mainStreamStarting = false;
+	mainStreamStopping = true;
+	mainStreamButton->setChecked(true);
+	mainStreamButton->setEnabled(false);
+	mainStreamButton->setText(QString::fromUtf8(obs_module_text("StoppingOutput")));
+	mainStreamButton->repaint(); // Keep the built-in stream visibly live while OBS stops it, then clear the row only on the confirmed stopped event. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+}
+
 void OutputDock::UpdateMainStreamStatus(bool active)
 {
+	mainStreamStarting = false;
+	mainStreamStopping = false;
+	mainStreamButton->setEnabled(true);
 	mainStreamButton->setChecked(active);
+	UpdateMainStreamRowStyle(active);
 	if (active) {
 		mainStreamStartTime = QDateTime::currentDateTime();
-		mainStreamButton->setText("00:00");
+		mainStreamBitrateTimer.invalidate();
+		mainStreamBytes = 0;
+		mainStreamBitrateKbps = 0.0;
+		mainStreamButton->setText(QString::fromUtf8(obs_module_text("StreamHealthSummary")).arg("0.0", "0.0", "00:00"));
 	} else {
 		mainStreamButton->setText("");
+		mainStreamButton->setToolTip(QString::fromUtf8(obs_module_text("Stream")));
+		mainStreamBitrateTimer.invalidate();
+		mainStreamBytes = 0;
+		mainStreamBitrateKbps = 0.0;
 		return;
 	}
 	if (!current_profile_config)
@@ -611,6 +706,16 @@ void OutputDock::UpdateMainStreamStatus(bool active)
 		}
 	}
 	obs_output_release(output);
+}
+
+void OutputDock::UpdateMainStreamRowStyle(bool active)
+{
+	if (mainStreamGroup->property("streaming").toBool() == active)
+		return;
+	mainStreamGroup->setProperty("streaming", active);
+	mainStreamGroup->style()->unpolish(mainStreamGroup);
+	mainStreamGroup->style()->polish(mainStreamGroup);
+	mainStreamGroup->update(); // Built-in streaming uses the same full-row warning as custom stream outputs; recording stays unchanged. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 }
 
 void OutputDock::UpdateMainRecordingStatus(bool active)
@@ -675,8 +780,10 @@ bool OutputDock::AddChapterToOutput(const char *output_name, const char *chapter
 
 void OutputDock::StartNextOutput()
 {
-	if (outputsToStart.empty())
+	if (outputsToStart.empty()) {
+		SetOutputsStarting(false);
 		return;
+	}
 	if (outputStarting >= outputsToStart.size())
 		outputStarting = 0;
 	auto startedAt = outputStarting;
@@ -694,9 +801,37 @@ void OutputDock::StartNextOutput()
 			blog(LOG_WARNING, "[Aitum Stream Suite] went through all outputs and %zu could not be started",
 			     outputsToStart.size());
 			outputsToStart.clear();
+			SetOutputsStarting(false);
 			break;
 		}
 	}
+}
+
+void OutputDock::SetOutputsStarting(bool starting)
+{
+	outputsStarting = starting;
+	if (!startAllAction || !startAllButton)
+		return;
+	startAllAction->setEnabled(!starting); // Start All owns one sequential queue, so its pending state is also the lock that prevents duplicate queue submissions. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+	const auto text = QString::fromUtf8(obs_module_text(starting ? "StartingOutputs" : "StartAll"));
+	startAllAction->setText(text);
+	startAllAction->setIconText(text);
+	startAllButton->repaint();
+}
+
+void OutputDock::SetOutputsStopping(bool stopping)
+{
+	outputsStopping = stopping;
+	if (!stopAllAction || !stopAllButton)
+		return;
+	stopAllAction->setEnabled(!stopping);
+	const auto text = QString::fromUtf8(obs_module_text(stopping ? "StoppingOutputs" : "StopAllOutputs"));
+	stopAllAction->setText(text);
+	stopAllAction->setIconText(text);
+	stopAllButton->setToolButtonStyle(stopping ? Qt::ToolButtonTextBesideIcon : Qt::ToolButtonIconOnly);
+	stopAllButton->setStyleSheet(stopping ? "QToolButton { min-width: 80px; max-width: none; }"
+						  : "QToolButton { min-width: 30px; max-width: none; }");
+	stopAllButton->repaint(); // Show text only during the pending stop so the idle toolbar stays compact. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
 }
 
 void OutputDock::frontend_event(enum obs_frontend_event event, void *private_data)
@@ -768,6 +903,10 @@ void OutputDock::frontend_event(enum obs_frontend_event event, void *private_dat
 
 void OutputDock::StartAll(bool streamOnly, bool recordOnly)
 {
+	if (outputsStarting) {
+		blog(LOG_INFO, "[Aitum Stream Suite] ignored duplicate Start All while outputs are starting");
+		return;
+	}
 	outputsToStart.clear();
 	if (mainStreamEnabled && !recordOnly) {
 		bool warnBeforeStreamStart =
@@ -859,12 +998,18 @@ void OutputDock::StartAll(bool streamOnly, bool recordOnly)
 	if (outputsToStart.empty())
 		return;
 	blog(LOG_INFO, "[Aitum Stream Suite] Starting %zu outputs", outputsToStart.size());
+	SetOutputsStarting(true);
 	StartNextOutput();
 }
 
 void OutputDock::StopAll(bool streamOnly, bool recordOnly)
 {
+	if (outputsStopping) {
+		blog(LOG_INFO, "[Aitum Stream Suite] ignored duplicate Stop All while outputs are stopping");
+		return;
+	}
 	outputsToStart.clear();
+	SetOutputsStarting(false);
 	bool warnStream = config_get_bool(obs_frontend_get_user_config(), "BasicWindow", "WarnBeforeStoppingStream");
 	bool warnRecord = config_get_bool(obs_frontend_get_user_config(), "BasicWindow", "WarnBeforeStoppingRecord");
 	if (warnStream && mainStreamEnabled && !recordOnly && obs_frontend_streaming_active() && isVisible()) {
@@ -882,6 +1027,25 @@ void OutputDock::StopAll(bool streamOnly, bool recordOnly)
 			return;
 	}
 
+	bool active = (mainStreamEnabled && !recordOnly && obs_frontend_streaming_active()) ||
+		      (mainRecordEnabled && !streamOnly && obs_frontend_recording_active()) ||
+		      (mainBacktrackEnabled && !streamOnly && obs_frontend_replay_buffer_active()) ||
+		      (mainVirtualCamEnabled && !streamOnly && !recordOnly && obs_frontend_virtualcam_active());
+	for (auto *outputWidget : outputWidgets) {
+		if ((streamOnly && !outputWidget->IsStream()) || (recordOnly && !outputWidget->IsRecord()))
+			continue;
+		auto output = outputWidget->GetOutput();
+		if (output && obs_output_active(output)) {
+			active = true;
+			break;
+		}
+	}
+	if (!active)
+		return;
+	SetOutputsStopping(true);
+
+	if (mainStreamEnabled && !recordOnly && obs_frontend_streaming_active())
+		UpdateMainStreamStopping();
 	if (mainStreamEnabled && !recordOnly && obs_frontend_streaming_active())
 		obs_frontend_streaming_stop();
 	if (mainRecordEnabled && !streamOnly && obs_frontend_recording_active())

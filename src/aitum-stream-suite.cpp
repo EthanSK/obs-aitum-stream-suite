@@ -20,6 +20,7 @@
 #include "version.h"
 #include <obs-frontend-api.h>
 #include <obs-module.h>
+#include <obs-properties.h>
 #include <QApplication>
 #include <QDesktopServices>
 #include <QDockWidget>
@@ -30,6 +31,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QStatusBar>
 #include <QTabWidget>
 #include <QToolBar>
 #include <random>
@@ -75,6 +77,67 @@ std::vector<std::tuple<std::string, std::string, std::string>> extensions = {};
 extern QWidget *aitumSettingsWidget;
 
 static bool finished_loading = false;
+
+// Aitum++: additive UI state. Advanced Workspaces opens after the normal OBS layout is captured, and the Tools toggle can still restore that familiar layout for the current session.
+static bool aitum_pp_controls_active = false;
+static bool aitum_pp_workspaces_active = false;
+static QByteArray aitum_pp_normal_state;
+static QAction *aitumPPControlsAction = nullptr;
+static QAction *aitumPPWorkspacesAction = nullptr;
+
+#ifdef __APPLE__
+struct MacOSScreenCaptureRestartResult {
+	size_t found = 0;
+	size_t restarted = 0;
+};
+
+static void restart_macos_screen_captures()
+{
+	MacOSScreenCaptureRestartResult result;
+	obs_enum_sources(
+		[](void *data, obs_source_t *source) {
+			auto result = static_cast<MacOSScreenCaptureRestartResult *>(data);
+			const char *source_id = obs_source_get_id(source);
+			if (!source_id || strcmp(source_id, "screen_capture") != 0) {
+				return true;
+			}
+
+			result->found++;
+			auto properties = obs_source_properties(source);
+			auto restart = properties ? obs_properties_get(properties, "reactivate_capture") : nullptr;
+			const bool restarted = restart && obs_property_enabled(restart) &&
+					       obs_property_button_clicked(restart, source);
+			if (restarted) {
+				result->restarted++;
+			}
+			blog(restarted ? LOG_INFO : LOG_WARNING,
+			     "[Aitum++] Restart Screen Capture: source='%s' result=%s", obs_source_get_name(source),
+			     restarted ? "restarted" : "not-restartable");
+			if (properties) {
+				obs_properties_destroy(properties);
+			}
+			return true;
+		},
+		&result);
+
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window || !main_window->statusBar()) {
+		return;
+	}
+	QString status;
+	if (result.found == 0) {
+		status = QString::fromUtf8(obs_module_text("RestartScreenCaptureNoneFound"));
+	} else if (result.restarted == 0) {
+		// OBS only enables its native restart action after ScreenCaptureKit reports a failure; forcing a rebuild by toggling source settings previously caused unsafe overlapping recoveries. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+		status = QString::fromUtf8(obs_module_text("RestartScreenCaptureNoneRestartable"));
+	} else {
+		status = QString::fromUtf8(obs_module_text("RestartScreenCaptureResult"))
+				 .arg(result.restarted)
+				 .arg(result.found);
+	}
+	main_window->statusBar()->showMessage(status, 5000);
+}
+#endif
 
 void AskUpdate()
 {
@@ -287,6 +350,12 @@ void transition_start(void *, calldata_t *)
 
 void save_dock_state(QString mode)
 {
+	// Aitum++: only persist workspace dock layouts while the user has the
+	// workspaces explicitly active, so the stock OBS layout never
+	// overwrites a stored Aitum workspace state.
+	if (!aitum_pp_workspaces_active) {
+		return;
+	}
 	if (mode.isEmpty()) {
 		return;
 	}
@@ -745,6 +814,11 @@ void load_dock_state(QString mode)
 		return;
 	}
 	scene_collection_changing = false;
+	// Aitum++: never rearrange the user's docks unless the workspaces were
+	// explicitly activated. OBS keeps its own familiar layout by default.
+	if (!aitum_pp_workspaces_active) {
+		return;
+	}
 	std::string state;
 	bool main_restored = false;
 	std::string setting_name = "dock_state_" + mode.toStdString();
@@ -877,6 +951,193 @@ void load_dock_state(QString mode)
 	}
 }
 
+// Aitum++: show only the minimum useful controls, the extra canvases and the
+// outputs dock, without touching the rest of the OBS layout.
+static void aitum_pp_show_minimal_controls()
+{
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window) {
+		return;
+	}
+	QList<QDockWidget *> docks;
+	for (const auto &it : canvas_docks) {
+		auto dw = qobject_cast<QDockWidget *>(it->parentWidget());
+		if (dw) {
+			docks.append(dw);
+		}
+	}
+	for (const auto &it : canvas_clone_docks) {
+		auto dw = qobject_cast<QDockWidget *>(it->parentWidget());
+		if (dw) {
+			docks.append(dw);
+		}
+	}
+	auto output = main_window->findChild<QDockWidget *>(QStringLiteral("AitumStreamSuiteOutput"));
+	if (output) {
+		docks.append(output);
+	}
+	QDockWidget *first_added = nullptr;
+	for (const auto &dock : docks) {
+		dock->setFloating(false);
+		if (main_window->dockWidgetArea(dock) == Qt::NoDockWidgetArea) {
+			if (first_added) {
+				main_window->tabifyDockWidget(first_added, dock);
+			} else {
+				main_window->addDockWidget(Qt::RightDockWidgetArea, dock);
+				first_added = dock;
+			}
+		}
+		dock->setVisible(true);
+		dock->raise();
+	}
+}
+
+// Aitum++: hide every plugin-owned dock so a session that ended in an Aitum
+// workspace cannot replace the stock OBS docks on the next launch. The main
+// canvas dock is excluded because creating it already requires an explicit
+// Aitum/MainCanvasDock opt-in. Ordinary OBS/user docks are never touched.
+static void aitum_pp_hide_additive_docks()
+{
+	if (aitum_pp_controls_active || aitum_pp_workspaces_active) {
+		return;
+	}
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window) {
+		return;
+	}
+	for (const auto &it : canvas_docks) {
+		auto dw = qobject_cast<QDockWidget *>(it->parentWidget());
+		if (dw && dw->isVisible()) {
+			dw->setVisible(false);
+		}
+	}
+	for (const auto &it : canvas_clone_docks) {
+		auto dw = qobject_cast<QDockWidget *>(it->parentWidget());
+		if (dw && dw->isVisible()) {
+			dw->setVisible(false);
+		}
+	}
+	for (const auto &it : empty_docks) {
+		auto dw = qobject_cast<QDockWidget *>(it->parentWidget());
+		if (dw && dw->isVisible()) {
+			dw->setVisible(false);
+		}
+	}
+	for (const auto &dock : main_window->findChildren<QDockWidget *>()) {
+		if (dock->objectName().startsWith(QStringLiteral("AitumStreamSuite")) &&
+		    dock->objectName() != QStringLiteral("AitumStreamSuiteMainCanvas") && dock->isVisible()) {
+			dock->setVisible(false);
+		}
+	}
+}
+
+// Aitum++: OBS has already restored the live dock layout before plugin docks are registered. Reapplying the saved DockState here hid stock docks on macOS, so only remove additive docks and capture the live layout.
+static void aitum_pp_preserve_live_obs_layout()
+{
+	if (aitum_pp_controls_active || aitum_pp_workspaces_active) {
+		return;
+	}
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window) {
+		return;
+	}
+	aitum_pp_hide_additive_docks();
+	aitum_pp_normal_state = main_window->saveState();
+	blog(LOG_INFO, "[Aitum++] Preserved live OBS dock layout");
+}
+
+static void aitum_pp_capture_normal_state()
+{
+	if (aitum_pp_controls_active || aitum_pp_workspaces_active) {
+		return;
+	}
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (main_window) {
+		aitum_pp_normal_state = main_window->saveState();
+	}
+}
+
+static void aitum_pp_restore_normal_state()
+{
+	if (aitum_pp_workspaces_active) {
+		return;
+	}
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window) {
+		return;
+	}
+	if (!aitum_pp_normal_state.isEmpty()) {
+		main_window->restoreState(aitum_pp_normal_state);
+	}
+	if (toolbar) {
+		toolbar->hide();
+	}
+	if (aitum_pp_controls_active) {
+		aitum_pp_show_minimal_controls();
+	}
+}
+
+static void aitum_pp_set_controls_active(bool active)
+{
+	if (active == aitum_pp_controls_active) {
+		return;
+	}
+	if (active) {
+		aitum_pp_capture_normal_state();
+		aitum_pp_controls_active = true;
+		aitum_pp_show_minimal_controls();
+	} else {
+		aitum_pp_controls_active = false;
+		aitum_pp_restore_normal_state();
+	}
+	if (aitumPPControlsAction && aitumPPControlsAction->isChecked() != active) {
+		aitumPPControlsAction->setChecked(active);
+	}
+}
+
+static void aitum_pp_set_workspaces_active(bool active)
+{
+	if (active == aitum_pp_workspaces_active) {
+		return;
+	}
+	if (active) {
+		aitum_pp_capture_normal_state();
+		aitum_pp_workspaces_active = true;
+		// Load the workspace state before showing the toolbar so the
+		// toolbar's resize driven auto-save cannot overwrite a stored
+		// workspace layout with the normal OBS layout.
+		if (modesTabBar) {
+			auto index = modesTabBar->currentIndex();
+			if (index >= 0) {
+				auto d = modesTabBar->tabData(index);
+				if (!d.isNull() && d.isValid() && !d.toString().isEmpty()) {
+					modesTab = d.toString();
+					load_dock_state(d.toString());
+				} else {
+					modesTab = modesTabBar->tabText(index);
+					load_dock_state(modesTabBar->tabText(index));
+				}
+			}
+		}
+		if (toolbar) {
+			toolbar->show();
+		}
+	} else {
+		// Keep the user's current workspace arrangement before leaving.
+		if (!current_profile_config || !obs_data_get_bool(current_profile_config, "dock_mode_manual_save")) {
+			save_dock_state(modesTab);
+		}
+		aitum_pp_workspaces_active = false;
+		if (toolbar) {
+			toolbar->hide();
+		}
+		aitum_pp_restore_normal_state();
+	}
+	if (aitumPPWorkspacesAction && aitumPPWorkspacesAction->isChecked() != active) {
+		aitumPPWorkspacesAction->setChecked(active);
+	}
+}
+
 void load_outputs()
 {
 	QMetaObject::invokeMethod(
@@ -976,8 +1237,12 @@ void create_new_dock_mode(const char *name)
 
 	auto index = modesTabBar->addTab(qname);
 	modesTabBar->setCurrentIndex(index);
-	reset_canvas_dock_state(name);
-	save_dock_state(qname);
+	// Aitum++: only rearrange docks for the new mode while the workspaces
+	// are explicitly active.
+	if (aitum_pp_workspaces_active) {
+		reset_canvas_dock_state(name);
+		save_dock_state(qname);
+	}
 }
 
 void load_canvas(bool check_new_canvas)
@@ -1439,6 +1704,10 @@ void load_current_profile_config()
 			}
 		},
 		Qt::QueuedConnection);
+	// Aitum++: the additive docks now exist, so hide them without replaying
+	// OBS's saved layout. Queued so it runs after pending dock events; no-op
+	// while Aitum++ is active.
+	QMetaObject::invokeMethod(modesTabBar, [] { aitum_pp_preserve_live_obs_layout(); }, Qt::QueuedConnection);
 }
 
 bool load_cef();
@@ -1543,6 +1812,22 @@ static void frontend_event(enum obs_frontend_event event, void *private_data)
 	UNUSED_PARAMETER(private_data);
 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
 		finished_loading = true;
+		// Aitum++: OBS may have restored a window state that had the
+		// workspace toolbar or the additive docks visible (e.g. from a
+		// stock install or a session that ended with Aitum++ active);
+		// hide only those additions and keep the live stock layout.
+		if (toolbar) {
+			QMetaObject::invokeMethod(
+				toolbar,
+				[] {
+					if (toolbar && !aitum_pp_workspaces_active) {
+						toolbar->hide();
+					}
+					aitum_pp_preserve_live_obs_layout();
+					aitum_pp_set_workspaces_active(true);
+				},
+				Qt::QueuedConnection);
+		}
 		if (restart) {
 			const auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
 			if (!main_window) {
@@ -1647,11 +1932,19 @@ static void frontend_event(enum obs_frontend_event event, void *private_data)
 		if (output_dock) {
 			output_dock->UpdateMainVirtualCameraStatus(false);
 		}
-	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING || event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
+	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING) {
+		if (output_dock) {
+			output_dock->UpdateMainStreamStarting();
+		}
+	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
 		if (output_dock) {
 			output_dock->UpdateMainStreamStatus(true);
 		}
-	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPING || event == OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
+	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
+		if (output_dock) {
+			output_dock->UpdateMainStreamStopping();
+		}
+	} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
 		if (output_dock) {
 			output_dock->UpdateMainStreamStatus(false);
 		}
@@ -1852,6 +2145,12 @@ void open_config_dialog(int tab, const char *create_type)
 		save_current_profile_config(true);
 		if (canvas_changed) {
 			load_canvas(check_new_canvas);
+			// Aitum++: editing canvases can create a newly visible OBS dock, so immediately match the UI mode the user chose.
+			if (aitum_pp_controls_active && !aitum_pp_workspaces_active) {
+				aitum_pp_show_minimal_controls();
+			} else {
+				aitum_pp_hide_additive_docks();
+			}
 			if (vendor) {
 				obs_websocket_vendor_emit_event(vendor, "canvas_changed", nullptr);
 			}
@@ -1871,7 +2170,7 @@ extern "C" const struct obs_source_info component_info;
 
 bool obs_module_load(void)
 {
-	blog(LOG_INFO, "[Aitum Stream Suite] loaded version %s", PROJECT_VERSION);
+	blog(LOG_INFO, "[Aitum Stream Suite] loaded version %s (Aitum++ fork)", PROJECT_VERSION);
 
 	obs_register_source(&component_info);
 
@@ -1885,19 +2184,10 @@ bool obs_module_load(void)
 	const auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
 	auto user_config = obs_frontend_get_user_config();
 	if (user_config) {
-		if (!config_get_bool(user_config, "Aitum", "ThemeSet")) {
-			auto theme = config_get_string(user_config, "Appearance", "Theme");
-			if ((!theme || strcmp(theme, "com.obsproject.Aitum.Original") != 0) &&
-			    (os_file_exists("data/obs-studio/themes/Aitum") ||
-			     os_file_exists("../../data/obs-studio/themes/Aitum"))) {
-				config_set_string(user_config, "Appearance", "Theme", "com.obsproject.Aitum.Original");
-				restart = true;
-			}
-			config_set_bool(user_config, "BasicWindow", "VerticalVolControl", true);
-			config_set_bool(user_config, "BasicWindow", "ShowContextToolbars", false);
-			config_set_bool(user_config, "Aitum", "ThemeSet", true);
-			config_save_safe(user_config, "tmp", "bak");
-		}
+		// Aitum++: no first-run appearance changes. The user's theme,
+		// mixer orientation and context toolbars stay untouched. Only
+		// apply the margins the Aitum theme expects if the user has
+		// picked that theme themselves.
 		const char *theme = config_get_string(user_config, "Appearance", "Theme");
 		if (theme && strcmp(theme, "com.obsproject.Aitum.Original") == 0) {
 			main_window->setContentsMargins(10, 10, 10, 10);
@@ -1912,6 +2202,8 @@ bool obs_module_load(void)
 	toolbar->setObjectName(QStringLiteral("AitumToolbar"));
 	main_window->addToolBar(toolbar);
 	toolbar->setFloatable(false);
+	// Aitum++: keep the toolbar hidden until OBS finishes loading so the untouched normal layout can be captured before Advanced Workspaces becomes the default.
+	toolbar->hide();
 	//tb->setMovable(false);
 	//tb->setAllowedAreas(Qt::ToolBarArea::TopToolBarArea);
 
@@ -2152,6 +2444,16 @@ bool obs_module_load(void)
 	//auto controlsToolBar = main_window->addToolBar(QString::fromUtf8(obs_module_text("Controls")));
 	auto controlsToolBar = toolbar;
 
+#ifdef __APPLE__
+	auto restartScreenCaptureAction =
+		controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
+					   QString::fromUtf8(obs_module_text("RestartScreenCapture")));
+	restartScreenCaptureAction->setToolTip(QString::fromUtf8(obs_module_text("RestartScreenCaptureTooltip")));
+	((QToolButton *)controlsToolBar->widgetForAction(restartScreenCaptureAction))
+		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	QObject::connect(restartScreenCaptureAction, &QAction::triggered, restart_macos_screen_captures);
+#endif
+
 	studioModeAction = controlsToolBar->addAction(QString::fromUtf8(obs_module_text("StudioMode")));
 
 	studioModeAction->setCheckable(true);
@@ -2176,8 +2478,12 @@ bool obs_module_load(void)
 	//action->setIcon(QIcon::fromTheme(QIcon::ThemeIcon::CameraWeb));
 	//action->setIcon(QIcon::fromTheme(QIcon::ThemeIcon::EditUndo));
 
+	// Aitum++: turning the main OBS preview into a dock replaces the normal
+	// OBS working layout, so it is opt-in (Aitum/MainCanvasDock=true in the
+	// user config) instead of the default.
 	auto cw = main_window->centralWidget();
-	if (cw && cw->objectName() == "centralwidget" && cw->findChild<QWidget *>("canvasEditor") != nullptr) {
+	if (user_config && config_get_bool(user_config, "Aitum", "MainCanvasDock") && cw &&
+	    cw->objectName() == "centralwidget" && cw->findChild<QWidget *>("canvasEditor") != nullptr) {
 		obs_frontend_add_dock_by_id("AitumStreamSuiteMainCanvas", obs_module_text("AitumStreamSuiteMainCanvas"), cw);
 		cw = new QWidget();
 		cw->setContentsMargins(0, 0, 0, 0);
@@ -2208,6 +2514,30 @@ bool obs_module_load(void)
 	transitions_dock = new TransitionsDock(main_window);
 	obs_frontend_add_dock_by_id("AitumStreamSuiteTransitions", obs_module_text("AitumStreamSuiteTransitions"),
 				    transitions_dock);
+
+	// Aitum++: compact entry points in the conventional Tools menu.
+	// "Aitum++ Controls" toggles the minimum useful controls (extra
+	// canvases + outputs dock), "Aitum++ Workspaces" is the advanced
+	// workspace toolbar, and "Aitum++ Settings" opens the config dialog.
+	aitumPPControlsAction =
+		static_cast<QAction *>(obs_frontend_add_tools_menu_qaction(obs_module_text("AitumPlusPlusControls")));
+	if (aitumPPControlsAction) {
+		aitumPPControlsAction->setCheckable(true);
+		QObject::connect(aitumPPControlsAction, &QAction::toggled,
+				 [](bool checked) { aitum_pp_set_controls_active(checked); });
+	}
+	aitumPPWorkspacesAction =
+		static_cast<QAction *>(obs_frontend_add_tools_menu_qaction(obs_module_text("AitumPlusPlusWorkspaces")));
+	if (aitumPPWorkspacesAction) {
+		aitumPPWorkspacesAction->setCheckable(true);
+		QObject::connect(aitumPPWorkspacesAction, &QAction::toggled,
+				 [](bool checked) { aitum_pp_set_workspaces_active(checked); });
+	}
+	auto aitumPPSettingsAction =
+		static_cast<QAction *>(obs_frontend_add_tools_menu_qaction(obs_module_text("AitumPlusPlusSettings")));
+	if (aitumPPSettingsAction) {
+		QObject::connect(aitumPPSettingsAction, &QAction::triggered, [] { open_config_dialog(0, nullptr); });
+	}
 
 	std::string url = "https://api.aitum.tv/plugin/streamsuite";
 	const char *pguid = config_get_string(obs_frontend_get_app_config(), "General", "InstallGUID");
@@ -2336,6 +2666,8 @@ void unload_obs_websocket();
 
 void obs_module_unload()
 {
+	aitumPPControlsAction = nullptr;
+	aitumPPWorkspacesAction = nullptr;
 	unload_obs_websocket();
 	obs_frontend_remove_save_callback(save_load, nullptr);
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
