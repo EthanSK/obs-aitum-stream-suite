@@ -114,6 +114,7 @@
     --bg_window: var(--blueDark);
     --bg_base: var(--blueMed);
     --bg_preview: var(--greyDark);
+    --bg_preview_matte: #3D4552;
 
     --primary: var(--blueCool);
     --primary_light: var(--blueLight);
@@ -1912,7 +1913,8 @@ QFrame [noticeFrame="true"] QLabel {
 /* Canvas / Preview background color */
 
 OBSQTDisplay {
-    qproperty-displayBackgroundColor: var(--bg_preview);
+    /* Aitum++: keep the editor-only area outside the transmitted canvas visibly distinct from black canvas content. */
+    qproperty-displayBackgroundColor: var(--bg_preview_matte);
     
 }
 
