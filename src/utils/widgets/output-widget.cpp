@@ -510,6 +510,12 @@ void OutputWidget::output_deactivate(void *data, calldata_t *calldata)
 			this_->SetStarting(false);
 			this_->SetStopping(false);
 			if (this_->output == deactivated_output) {
+				if (obs_output_active(deactivated_output)) { // A reconnect deactivates the old capture before its retry thread starts; releasing the output here leaves that thread with freed state and crashes OBS in obs_output_actual_start. Retain the widget reference until reconnect succeeds or a real stop completes. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+					blog(LOG_INFO, "[Aitum Stream Suite] output '%s' deactivated while reconnecting; retained",
+					     output_name.c_str());
+					obs_output_release(deactivated_output);
+					return;
+				}
 				auto signal = obs_output_get_signal_handler(deactivated_output);
 				signal_handler_disconnect(signal, "start", output_start, this_);
 				signal_handler_disconnect(signal, "stop", output_stop, this_);
