@@ -34,6 +34,8 @@
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QToolBar>
+#include <QUrl>
+#include <QUrlQuery>
 #include <random>
 #include <util/dstr.h>
 
@@ -136,6 +138,50 @@ static void restart_macos_screen_captures()
 				 .arg(result.found);
 	}
 	main_window->statusBar()->showMessage(status, 5000);
+}
+
+static void restart_obs_via_obscene()
+{
+	char *profile = obs_frontend_get_current_profile();
+	char *scene_collection = obs_frontend_get_current_scene_collection();
+	auto scene = obs_frontend_get_current_scene();
+	const QString profile_name = QString::fromUtf8(profile ? profile : "");
+	const QString scene_collection_name = QString::fromUtf8(scene_collection ? scene_collection : "");
+	const QString scene_name = QString::fromUtf8(scene ? obs_source_get_name(scene) : "");
+	bfree(profile);
+	bfree(scene_collection);
+	obs_source_release(scene);
+
+	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (profile_name.isEmpty() || scene_collection_name.isEmpty() || scene_name.isEmpty()) {
+		blog(LOG_ERROR, "[Aitum++] Restart OBS: current OBS selection is unavailable");
+		if (main_window && main_window->statusBar()) {
+			main_window->statusBar()->showMessage(QString::fromUtf8(obs_module_text("RestartOBSContextUnavailable")),
+							     5000);
+		}
+		return;
+	}
+
+	QUrl restart_request;
+	restart_request.setScheme("obscene");
+	restart_request.setHost("restart-obs");
+	QUrlQuery restart_query;
+	restart_query.addQueryItem("profile", profile_name);
+	restart_query.addQueryItem("sceneCollection", scene_collection_name);
+	restart_query.addQueryItem("scene", scene_name);
+	restart_request.setQuery(restart_query);
+	if (!QDesktopServices::openUrl(restart_request)) { // This is a real restart request: the app URL reaches OBScene even when macOS must launch it first, then OBScene checks output state, saves the collection, relaunches the exact profile/collection/scene, and restores the OBS Space. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
+		blog(LOG_ERROR, "[Aitum++] Restart OBS: OBScene could not be opened");
+		if (main_window && main_window->statusBar()) {
+			main_window->statusBar()->showMessage(QString::fromUtf8(obs_module_text("RestartOBSOBSceneUnavailable")),
+							     5000);
+		}
+		return;
+	}
+	blog(LOG_INFO, "[Aitum++] Restart OBS requested through OBScene");
+	if (main_window && main_window->statusBar()) {
+		main_window->statusBar()->showMessage(QString::fromUtf8(obs_module_text("RestartOBSRequested")), 5000);
+	}
 }
 #endif
 
@@ -1982,6 +2028,9 @@ static void frontend_event(enum obs_frontend_event event, void *private_data)
 			}
 			obs_frontend_source_list_free(&transitions);
 			load_current_profile_config();
+			if (scenes_dock) {
+				QMetaObject::invokeMethod(scenes_dock, "BindMainCanvas", Qt::QueuedConnection); // Switching collections destroys the canvas tracked by the shared Sources dock, so bind it to the new main canvas after Aitum reloads the collection. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
+			}
 
 			auto scene = obs_frontend_get_current_scene();
 			if (scene) {
@@ -2452,6 +2501,12 @@ bool obs_module_load(void)
 	((QToolButton *)controlsToolBar->widgetForAction(restartScreenCaptureAction))
 		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	QObject::connect(restartScreenCaptureAction, &QAction::triggered, restart_macos_screen_captures);
+
+	auto restartOBSAction = controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
+						       QString::fromUtf8(obs_module_text("RestartOBS")));
+	restartOBSAction->setToolTip(QString::fromUtf8(obs_module_text("RestartOBSTooltip")));
+	((QToolButton *)controlsToolBar->widgetForAction(restartOBSAction))->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	QObject::connect(restartOBSAction, &QAction::triggered, restart_obs_via_obscene);
 #endif
 
 	studioModeAction = controlsToolBar->addAction(QString::fromUtf8(obs_module_text("StudioMode")));

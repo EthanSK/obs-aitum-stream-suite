@@ -971,9 +971,11 @@ void ScenesDock::FinishedLoading()
 			dockSubMenu->addAction(dockAction);
 		}
 	}
-	if (canvas) {
-		return;
-	}
+	BindMainCanvas();
+}
+
+void ScenesDock::BindMainCanvas()
+{
 	auto mc = obs_get_main_canvas();
 	if (!mc) {
 		return;
