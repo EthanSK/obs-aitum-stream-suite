@@ -2621,13 +2621,13 @@ bool obs_module_load(void)
 	//auto controlsToolBar = main_window->addToolBar(QString::fromUtf8(obs_module_text("Controls")));
 	auto controlsToolBar = toolbar;
 
-#ifdef __APPLE__
+#ifdef __APPLE__ // Icons keep OBS++ within 960 px; tooltips keep names. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
 	auto restartScreenCaptureAction =
 		controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
 					   QString::fromUtf8(obs_module_text("RestartScreenCapture")));
 	restartScreenCaptureAction->setToolTip(QString::fromUtf8(obs_module_text("RestartScreenCaptureTooltip")));
 	((QToolButton *)controlsToolBar->widgetForAction(restartScreenCaptureAction))
-		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+		->setToolButtonStyle(Qt::ToolButtonIconOnly);
 	QObject::connect(restartScreenCaptureAction, &QAction::triggered, restart_macos_screen_captures);
 
 	auto restartCameraServicesAction =
@@ -2635,13 +2635,13 @@ bool obs_module_load(void)
 					   QString::fromUtf8(obs_module_text("RestartCameraServices")));
 	restartCameraServicesAction->setToolTip(QString::fromUtf8(obs_module_text("RestartCameraServicesTooltip")));
 	((QToolButton *)controlsToolBar->widgetForAction(restartCameraServicesAction))
-		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+		->setToolButtonStyle(Qt::ToolButtonIconOnly);
 	QObject::connect(restartCameraServicesAction, &QAction::triggered, restart_macos_camera_services);
 
 	auto restartOBSAction = controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
 						       QString::fromUtf8(obs_module_text("RestartOBS")));
 	restartOBSAction->setToolTip(QString::fromUtf8(obs_module_text("RestartOBSTooltip")));
-	((QToolButton *)controlsToolBar->widgetForAction(restartOBSAction))->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	((QToolButton *)controlsToolBar->widgetForAction(restartOBSAction))->setToolButtonStyle(Qt::ToolButtonIconOnly);
 	QObject::connect(restartOBSAction, &QAction::triggered, restart_obs_via_obscene);
 #endif
 
