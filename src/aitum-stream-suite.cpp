@@ -31,9 +31,11 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QProcess>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QToolBar>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <random>
@@ -93,6 +95,13 @@ struct MacOSScreenCaptureRestartResult {
 	size_t restarted = 0;
 };
 
+struct MacOSCameraSourceRefreshResult {
+	size_t found = 0;
+	size_t refreshed = 0;
+};
+
+static bool camera_services_restart_in_progress = false;
+
 static void restart_macos_screen_captures()
 {
 	MacOSScreenCaptureRestartResult result;
@@ -138,6 +147,125 @@ static void restart_macos_screen_captures()
 				 .arg(result.found);
 	}
 	main_window->statusBar()->showMessage(status, 5000);
+}
+
+static void refresh_macos_camera_sources()
+{
+	MacOSCameraSourceRefreshResult result;
+	obs_enum_sources(
+		[](void *data, obs_source_t *source) {
+			auto *result = static_cast<MacOSCameraSourceRefreshResult *>(data);
+			const char *source_id = obs_source_get_id(source);
+			if (!source_id || (strcmp(source_id, "macos-avcapture") != 0 &&
+				   strcmp(source_id, "macos-avcapture-fast") != 0)) {
+				return true;
+			}
+
+			result->found++;
+			auto *settings = obs_source_get_settings(source);
+			const bool refreshed = settings != nullptr;
+			if (settings) {
+				obs_source_update(source, settings); // A camera missing during OBS startup is not reopened by its later macOS connect event, so reapply the unchanged settings after the camera services return. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
+				obs_data_release(settings);
+				result->refreshed++;
+			}
+			blog(LOG_INFO, "[Aitum++] Restart Camera Services: source='%s' result=%s",
+			     obs_source_get_name(source), refreshed ? "refreshed" : "settings-unavailable");
+			return true;
+		},
+		&result);
+
+	camera_services_restart_in_progress = false;
+	auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (!main_window || !main_window->statusBar()) {
+		return;
+	}
+	const QString status = result.found == 0
+				       ? QString::fromUtf8(obs_module_text("RestartCameraServicesNoSources"))
+				       : QString::fromUtf8(obs_module_text("RestartCameraServicesResult"))
+						 .arg(result.refreshed)
+						 .arg(result.found);
+	main_window->statusBar()->showMessage(status, 5000);
+}
+
+static bool any_obs_output_active()
+{
+	bool active = false;
+	obs_enum_outputs(
+		[](void *data, obs_output_t *output) {
+			auto *active = static_cast<bool *>(data);
+			if (obs_output_active(output)) {
+				*active = true;
+				return false;
+			}
+			return true;
+		},
+		&active);
+	return active;
+}
+
+static void restart_macos_camera_services()
+{
+	auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	if (camera_services_restart_in_progress) {
+		if (main_window && main_window->statusBar()) {
+			main_window->statusBar()->showMessage(
+				QString::fromUtf8(obs_module_text("RestartCameraServicesInProgress")), 5000);
+		}
+		return;
+	}
+	if (any_obs_output_active() || obs_frontend_virtualcam_active()) {
+		if (main_window && main_window->statusBar()) {
+			main_window->statusBar()->showMessage(
+				QString::fromUtf8(obs_module_text("RestartCameraServicesOutputsActive")), 5000);
+		}
+		return;
+	}
+
+	camera_services_restart_in_progress = true;
+	auto *process = new QProcess(main_window);
+	QObject::connect(process, &QProcess::errorOccurred, [process, main_window](QProcess::ProcessError) {
+		if (!camera_services_restart_in_progress) {
+			return;
+		}
+		camera_services_restart_in_progress = false;
+		blog(LOG_ERROR, "[Aitum++] Restart Camera Services: could not launch administrator request");
+		if (main_window && main_window->statusBar()) {
+			main_window->statusBar()->showMessage(
+				QString::fromUtf8(obs_module_text("RestartCameraServicesFailed")), 5000);
+		}
+		process->deleteLater();
+	});
+	QObject::connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+			 [process, main_window](int exit_code, QProcess::ExitStatus exit_status) {
+				 if (!camera_services_restart_in_progress) {
+					 return;
+				 }
+				 process->deleteLater();
+				 if (exit_status != QProcess::NormalExit || exit_code != 0) {
+					 camera_services_restart_in_progress = false;
+					 blog(LOG_WARNING,
+					      "[Aitum++] Restart Camera Services: administrator request cancelled or failed");
+					 if (main_window && main_window->statusBar()) {
+						 main_window->statusBar()->showMessage(
+							 QString::fromUtf8(obs_module_text("RestartCameraServicesFailed")),
+							 5000);
+					 }
+					 return;
+				 }
+
+				 blog(LOG_INFO, "[Aitum++] Restart Camera Services: macOS camera services restarted");
+				 if (main_window && main_window->statusBar()) {
+					 main_window->statusBar()->showMessage(
+						 QString::fromUtf8(obs_module_text("RestartCameraServicesRefreshing")), 5000);
+				 }
+				 QTimer::singleShot(2000, main_window, refresh_macos_camera_sources);
+			 });
+	process->start(
+		QStringLiteral("/usr/bin/osascript"),
+		{QStringLiteral("-e"),
+		 QStringLiteral("do shell script \"/usr/bin/killall -TERM UVCAssistant cameracaptured VDCAssistant\" "
+				"with administrator privileges")});
 }
 
 static void restart_obs_via_obscene()
@@ -2501,6 +2629,14 @@ bool obs_module_load(void)
 	((QToolButton *)controlsToolBar->widgetForAction(restartScreenCaptureAction))
 		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	QObject::connect(restartScreenCaptureAction, &QAction::triggered, restart_macos_screen_captures);
+
+	auto restartCameraServicesAction =
+		controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
+					   QString::fromUtf8(obs_module_text("RestartCameraServices")));
+	restartCameraServicesAction->setToolTip(QString::fromUtf8(obs_module_text("RestartCameraServicesTooltip")));
+	((QToolButton *)controlsToolBar->widgetForAction(restartCameraServicesAction))
+		->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	QObject::connect(restartCameraServicesAction, &QAction::triggered, restart_macos_camera_services);
 
 	auto restartOBSAction = controlsToolBar->addAction(QIcon(":/res/images/refresh.svg"),
 						       QString::fromUtf8(obs_module_text("RestartOBS")));
