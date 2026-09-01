@@ -188,22 +188,6 @@ static void refresh_macos_camera_sources()
 	main_window->statusBar()->showMessage(status, 5000);
 }
 
-static bool any_obs_output_active()
-{
-	bool active = false;
-	obs_enum_outputs(
-		[](void *data, obs_output_t *output) {
-			auto *active = static_cast<bool *>(data);
-			if (obs_output_active(output)) {
-				*active = true;
-				return false;
-			}
-			return true;
-		},
-		&active);
-	return active;
-}
-
 static void restart_macos_camera_services()
 {
 	auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
@@ -214,15 +198,8 @@ static void restart_macos_camera_services()
 		}
 		return;
 	}
-	if (any_obs_output_active() || obs_frontend_virtualcam_active()) {
-		if (main_window && main_window->statusBar()) {
-			main_window->statusBar()->showMessage(
-				QString::fromUtf8(obs_module_text("RestartCameraServicesOutputsActive")), 5000);
-		}
-		return;
-	}
 
-	camera_services_restart_in_progress = true;
+	camera_services_restart_in_progress = true; // A camera can disappear during a live output, so keep recording, streaming, and the virtual camera running while the macOS camera services recover; frames can briefly drop, but stopping the output creates a permanent gap. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
 	auto *process = new QProcess(main_window);
 	QObject::connect(process, &QProcess::errorOccurred, [process, main_window](QProcess::ProcessError) {
 		if (!camera_services_restart_in_progress) {
