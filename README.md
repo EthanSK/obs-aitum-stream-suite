@@ -44,6 +44,9 @@ website demonstrates the layout; it does not call recovery commands on your Mac.
 **Source distribution:** this fork has no public installer or binary release.
 Ethan uses a local Apple-silicon build with OBS++ 32.2.2. Upstream Aitum downloads
 do not include this fork's changes.
+The fork does not show upstream Aitum version prompts; install updates from this
+repository instead. Its metadata feed still supplies partner blocks, extensions,
+and overlay availability.
 
 Use full Xcode, Git and CMake 3.28+ on macOS. The preset downloads and builds the
 OBS development libraries and fetches Qt/other dependencies pinned in

@@ -71,7 +71,6 @@ private:
 
 	QFormLayout *canvasLayout;
 	QFormLayout *outputsLayout;
-	QLabel *newVersion;
 
 	QTextEdit *troubleshooterText;
 
@@ -115,7 +114,6 @@ public:
 	~OBSBasicSettings();
 
 	void LoadSettings(obs_data_t *settings);
-	void SetNewerVersion(QString newer_version_available);
 	void ShowTab(int i);
 	void SetCreateType(const char *create_type);
 	void SaveHotkeys();

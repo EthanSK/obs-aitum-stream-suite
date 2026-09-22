@@ -441,13 +441,6 @@ OBSBasicSettings::OBSBasicSettings(QMainWindow *parent) : QDialog(parent)
 	version->setOpenExternalLinks(true);
 	version->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
-	newVersion = new QLabel;
-	newVersion->setProperty("themeID", "warning");
-	newVersion->setProperty("class", "text-warning");
-	newVersion->setVisible(false);
-	newVersion->setOpenExternalLinks(true);
-	newVersion->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-
 	auto buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
 
 	connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -455,7 +448,6 @@ OBSBasicSettings::OBSBasicSettings(QMainWindow *parent) : QDialog(parent)
 
 	QHBoxLayout *bottomLayout = new QHBoxLayout;
 	bottomLayout->addWidget(version, 1, Qt::AlignLeft);
-	bottomLayout->addWidget(newVersion, 1, Qt::AlignLeft);
 	bottomLayout->addWidget(buttonBox, 0, Qt::AlignRight);
 
 	QHBoxLayout *contentLayout = new QHBoxLayout;
@@ -1265,14 +1257,6 @@ void OBSBasicSettings::RefreshProperties(obs_properties_t *properties, QFormLayo
 		}
 		obs_property_next(&property);
 	}
-}
-
-void OBSBasicSettings::SetNewerVersion(QString newer_version_available)
-{
-	if (newer_version_available.isEmpty())
-		return;
-	newVersion->setText(QString::fromUtf8(obs_module_text("NewVersion")).arg(newer_version_available));
-	newVersion->setVisible(true);
 }
 
 void OBSBasicSettings::AddCanvas()

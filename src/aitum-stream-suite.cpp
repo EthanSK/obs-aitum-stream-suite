@@ -28,7 +28,6 @@
 #include <QMap>
 #include <QMenu>
 #include <QMenuBar>
-#include <QMessageBox>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QProcess>
@@ -45,7 +44,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_AUTHOR("Aitum");
 OBS_MODULE_USE_DEFAULT_LOCALE("aitum-stream-suite", "en-US")
 
-download_info_t *version_download_info = nullptr;
+download_info_t *plugin_metadata_download_info = nullptr;
 obs_data_t *current_profile_config = nullptr;
 QTabBar *modesTabBar = nullptr;
 QToolBar *toolbar = nullptr;
@@ -65,8 +64,6 @@ StatsDock *stats_dock = nullptr;
 ScenesDock *scenes_dock = nullptr;
 SourcesDock *sources_dock = nullptr;
 TransitionsDock *transitions_dock = nullptr;
-
-QString newer_version_available;
 
 QTimer load_dock_state_timer;
 QList<QString> loaded_docks;
@@ -290,48 +287,7 @@ static void restart_obs_via_obscene()
 }
 #endif
 
-void AskUpdate()
-{
-	auto parts = newer_version_available.split(".");
-	if (parts.count() < 3) {
-		return;
-	}
-	int major = parts.value(0).toInt();
-	int minor = parts.value(1).toInt();
-	int patch = parts.value(2).toInt();
-	auto sv = MAKE_SEMANTIC_VERSION(major, minor, patch);
-	auto user_config = obs_frontend_get_user_config();
-
-	auto skip_version = user_config ? config_get_int(user_config, "Aitum", "skip_version") : 0;
-	if (sv == skip_version) {
-		return;
-	}
-
-	auto main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
-	if (!main_window) {
-		return;
-	}
-
-	QMessageBox mb(QMessageBox::Question, QString::fromUtf8(obs_frontend_get_locale_string("Updater.Title")),
-		       QString::fromUtf8(obs_frontend_get_locale_string("Updater.Text")) + " " +
-			       QString::fromUtf8(obs_module_text("AitumStreamSuite")) + " " + newer_version_available,
-		       QMessageBox::StandardButtons(), main_window);
-	auto update = mb.addButton(QString::fromUtf8(obs_frontend_get_locale_string("Updater.UpdateNow")), QMessageBox::YesRole);
-	auto remind =
-		mb.addButton(QString::fromUtf8(obs_frontend_get_locale_string("Updater.RemindMeLater")), QMessageBox::RejectRole);
-	auto skip = mb.addButton(QString::fromUtf8(obs_frontend_get_locale_string("Updater.Skip")), QMessageBox::NoRole);
-	mb.setDefaultButton(remind);
-	mb.exec();
-
-	if (mb.clickedButton() == update) {
-		QDesktopServices::openUrl(QUrl(QString::fromUtf8("https://aitum.tv/download/stream-suite")));
-	} else if (mb.clickedButton() == skip && user_config) {
-		config_set_int(user_config, "Aitum", "skip_version", sv);
-		config_save_safe(user_config, "tmp", "bak");
-	}
-}
-
-bool version_info_downloaded(void *param, struct file_download_data *file)
+bool plugin_metadata_downloaded(void *param, struct file_download_data *file)
 {
 	UNUSED_PARAMETER(param);
 	if (!file || !file->buffer.num) {
@@ -340,9 +296,9 @@ bool version_info_downloaded(void *param, struct file_download_data *file)
 
 	auto d = obs_data_create_from_json((const char *)file->buffer.array);
 	if (!d) {
-		if (version_download_info) {
-			download_info_destroy(version_download_info);
-			version_download_info = nullptr;
+		if (plugin_metadata_download_info) {
+			download_info_destroy(plugin_metadata_download_info);
+			plugin_metadata_download_info = nullptr;
 		}
 		return true;
 	}
@@ -350,28 +306,11 @@ bool version_info_downloaded(void *param, struct file_download_data *file)
 	auto data_obj = obs_data_get_obj(d, "data");
 	obs_data_release(d);
 	if (!data_obj) {
-		if (version_download_info) {
-			download_info_destroy(version_download_info);
-			version_download_info = nullptr;
+		if (plugin_metadata_download_info) {
+			download_info_destroy(plugin_metadata_download_info);
+			plugin_metadata_download_info = nullptr;
 		}
 		return true;
-	}
-
-	auto version = obs_data_get_string(data_obj, "version");
-	int major;
-	int minor;
-	int patch;
-	if (sscanf(version, "%d.%d.%d", &major, &minor, &patch) == 3) {
-		auto sv = MAKE_SEMANTIC_VERSION(major, minor, patch);
-		if (sv > MAKE_SEMANTIC_VERSION(PROJECT_VERSION_MAJOR, PROJECT_VERSION_MINOR, PROJECT_VERSION_PATCH)) {
-			newer_version_available = QString::fromUtf8(version);
-			QMetaObject::invokeMethod(aitumSettingsWidget, [] {
-				aitumSettingsWidget->setStyleSheet(QString::fromUtf8("background: rgb(192,128,0);"));
-				if (finished_loading) {
-					AskUpdate();
-				}
-			});
-		}
 	}
 
 	obs_data_array_t *blocks = obs_data_get_array(data_obj, "partnerBlocks");
@@ -484,9 +423,9 @@ bool version_info_downloaded(void *param, struct file_download_data *file)
 
 	obs_data_release(data_obj);
 
-	if (version_download_info) {
-		download_info_destroy(version_download_info);
-		version_download_info = nullptr;
+	if (plugin_metadata_download_info) {
+		download_info_destroy(plugin_metadata_download_info);
+		plugin_metadata_download_info = nullptr;
 	}
 	return true;
 }
@@ -2015,9 +1954,6 @@ static void frontend_event(enum obs_frontend_event event, void *private_data)
 		if (scenes_dock) {
 			QMetaObject::invokeMethod(scenes_dock, "FinishedLoading", Qt::QueuedConnection);
 		}
-		if (!newer_version_available.isEmpty()) {
-			AskUpdate();
-		}
 	} else if (event == OBS_FRONTEND_EVENT_PROFILE_CHANGED) {
 		DestroyPanelCookieManager();
 		load_browser_panels();
@@ -2238,7 +2174,6 @@ void open_config_dialog(int tab, const char *create_type)
 	}
 
 	configDialog->LoadSettings(settings);
-	configDialog->SetNewerVersion(newer_version_available);
 	if (tab > 0) {
 		configDialog->ShowTab(tab);
 	}
@@ -2713,8 +2648,9 @@ bool obs_module_load(void)
 		url += pguid;
 	}
 
-	version_download_info =
-		download_info_create_single("[Aitum Stream Suite]", "OBS", url.c_str(), version_info_downloaded, nullptr);
+	// Keep partner blocks, extensions, and overlays, but do not offer upstream Aitum binaries for this fork.
+	plugin_metadata_download_info = download_info_create_single(
+		"[Aitum Stream Suite]", "OBS", url.c_str(), plugin_metadata_downloaded, nullptr);
 	return true;
 }
 
@@ -2838,9 +2774,9 @@ void obs_module_unload()
 	unload_obs_websocket();
 	obs_frontend_remove_save_callback(save_load, nullptr);
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
-	if (version_download_info) {
-		download_info_destroy(version_download_info);
-		version_download_info = nullptr;
+	if (plugin_metadata_download_info) {
+		download_info_destroy(plugin_metadata_download_info);
+		plugin_metadata_download_info = nullptr;
 	}
 	if (current_profile_config) {
 		obs_data_release(current_profile_config);
